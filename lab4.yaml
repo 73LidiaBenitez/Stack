@@ -1,0 +1,458 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: "Lab 4 of SysOps for monitoring and alarming"
+
+Parameters:
+
+  AmazonLinuxAMIID:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+
+Resources:
+
+###########
+# EC2 Enforcer Roles and Components
+###########
+  LambdaIamRole:
+      Type: "AWS::IAM::Role"
+      Properties:
+        RoleName: LabInstanceCount
+        AssumeRolePolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+                  -
+                    Effect: "Allow"
+                    Principal:
+                        Service:
+                          - lambda.amazonaws.com
+                    Action:
+                        - "sts:AssumeRole"
+        Policies:
+            -
+                  PolicyName: "LambdaPolicy"
+                  PolicyDocument:
+                    Version: "2012-10-17"
+                    Statement:
+                        -
+                          Effect: "Allow"
+                          Action:
+                              - ec2:*
+                          Resource: "*"
+                        -
+                          Effect: "Allow"
+                          Action:
+                              - "logs:CreateLogGroup"
+                              - "logs:CreateLogStream"
+                              - "logs:PutLogEvents"
+                          Resource: "*"
+
+  RulesPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+        FunctionName: !Ref Ec2NumInstancesEnforcer
+        Action: "lambda:InvokeFunction"
+        Principal: "events.amazonaws.com"
+        SourceArn: !GetAtt EventRule.Arn
+
+  EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+        Description: "EventRule"
+        EventPattern:
+          source:
+              -  "aws.ec2"
+          detail-type:
+              - "EC2 Instance State-change Notification"
+          detail:
+              state: ["running"]
+        State: "ENABLED"
+        Targets:
+          -
+              Arn: !GetAtt Ec2NumInstancesEnforcer.Arn
+              Id: Lambda1
+
+  Ec2NumInstancesEnforcer:
+    Type: "AWS::Lambda::Function"
+    Properties:
+        FunctionName: Ec2NumInstancesEnforcer
+        Handler: index.handler
+        Role: !GetAtt LambdaIamRole.Arn
+        Runtime: python3.7
+        Environment:
+          Variables:
+              ALLOWED_REGIONS: !Ref AWS::Region
+              MAX_INSTANCES: '1'
+        Code:
+          ZipFile: |
+              import boto3
+              import json
+              import os
+              allowed_regions=os.getenv('ALLOWED_REGIONS')
+              max_instances=int(os.getenv('MAX_INSTANCES'))
+              print('allowed regions', allowed_regions, 'max instances',max_instances)
+              clients={}
+              for region in allowed_regions.split(','):
+                clients[region] = boto3.client('ec2',region_name=region)
+
+              def numNonTerminatedInstances(client):
+                useful_states=['pending','running','shutting-down','stopping','stopped']
+                max_results=100
+                ans=client.describe_instances(
+                    Filters=[
+                      {'Name': 'instance-state-name', 'Values':useful_states}
+                    ],
+                    MaxResults=max_results
+                )
+                return sum(map(lambda r: len(r['Instances']), ans['Reservations']))
+
+              def numAllNonTerminatedInstances(clients):
+                return sum(map(lambda client: numNonTerminatedInstances(client), clients.values()))
+
+              def enforceInstance(instanceId, region):
+                num_instances=numAllNonTerminatedInstances(clients)
+                print('checking instance', instanceId, region, region in allowed_regions, num_instances)
+                client_for_deleting=None
+                if region not in allowed_regions:
+                    client_for_deleting=boto3.client('ec2',region_name=region)
+                elif num_instances > max_instances:
+                    client_for_deleting=clients[region]
+                if client_for_deleting:
+                    try:
+                      print( client_for_deleting.terminate_instances(InstanceIds= [instanceId]) )
+                    except Exception as e:
+                      print('problem deleting instance', instanceId, e)
+                else:
+                      print('Allowing instance', instanceId, region)
+
+              def handler(event, context):
+                print('event ...', event)
+                region=event['region']
+                instance_id=event['detail']['instance-id']
+                enforceInstance(instance_id,region)
+
+###########
+# Region specific actions and group assignment for student
+###########
+  EC2UserGroup:
+    Type: "AWS::IAM::Group"
+    Properties:
+      GroupName: EC2UserGroup
+      Path: "/"
+      Policies:
+        - PolicyName: myAppPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - "ec2:RunInstances"
+              - "ec2:StartInstances"
+              - "ec2:CreateTags"
+              - "ec2:TerminateInstances"
+              Resource: "*"
+              Condition:
+                  StringEquals:
+                    'aws:RequestedRegion': !Sub '${AWS::Region}'
+
+  EC2GroupAssignment:
+    Type: "AWS::IAM::UserToGroupAddition"
+    DependsOn: EC2UserGroup
+    Properties:
+      GroupName: EC2UserGroup
+      Users:
+        - awsstudent
+
+###########
+# Lab Network Structure
+###########
+  LabVPC:
+    Type: "AWS::EC2::VPC"
+    Properties:
+        CidrBlock: "10.0.0.0/16"
+        InstanceTenancy: "default"
+        EnableDnsSupport: true
+        EnableDnsHostnames: true
+        Tags:
+          -
+            Key: "Name"
+            Value: "LabVPC"
+
+  RouteTable:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+        VpcId: !Ref LabVPC
+
+  PublicRoute:
+    Type: 'AWS::EC2::Route'
+    DependsOn:
+      - GatewayAttach
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW
+
+  RouteTableAssociation:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+        SubnetId: !Ref Subnet1
+        RouteTableId: !Ref RouteTable
+
+  Subnet1:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+        VpcId: !Ref LabVPC
+        CidrBlock: "10.0.0.0/24"
+        MapPublicIpOnLaunch: true
+        AvailabilityZone: !Join
+              - ''
+              - - !Ref 'AWS::Region'
+                - a
+
+  IGW:
+    Type: "AWS::EC2::InternetGateway"
+
+  GatewayAttach:
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    Properties:
+        VpcId: !Ref LabVPC
+        InternetGatewayId: !Ref IGW
+
+  AppServerSG:
+      Type: "AWS::EC2::SecurityGroup"
+      Properties:
+          GroupDescription: "SG that allows inbound http traffic to AppServers"
+          GroupName: "AppServerSG"
+          VpcId: !Ref LabVPC
+          SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            CidrIp: 0.0.0.0/0
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            CidrIp: 0.0.0.0/0
+
+###########
+# ReadOnly group for student
+###########
+  ReadOnlyGroup:
+    Type: "AWS::IAM::Group"
+    Properties:
+      GroupName: QLReadOnly
+      ManagedPolicyArns: [ "arn:aws:iam::aws:policy/ReadOnlyAccess" ]
+      Path: /
+      Policies:
+        - PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Deny
+                Action:
+                  - "iam:Get*"
+                  - "iam:List*"
+                Resource:
+                  - "arn:aws:iam::*:policy/lab_policy"
+                  - "arn:aws:iam::*:policy/ReadOnly2Policy"
+                  - "arn:aws:iam::*:policy/default_iam_policy"
+                  - "arn:aws:iam::*:policy/default_QL_policy"
+                  - "arn:aws:iam::*:policy/default_policy"
+                  - "arn:aws:iam::*:group/QLReadOnly"
+              - Effect: Deny
+                Action:
+                  - "cloudformation:Set*"
+                  - "cloudformation:List*"
+                  - "cloudformation:Describe*"
+                  - "cloudformation:Get*"
+                Resource:
+                  - "arn:aws:cloudformation:*:*:stack/qls*/*"
+          PolicyName: ReadOnly2Policy
+
+  ROGroupAssignment:
+    Type: "AWS::IAM::UserToGroupAddition"
+    DependsOn: ReadOnlyGroup
+    Properties:
+      GroupName: QLReadOnly
+      Users:
+        - awsstudent
+
+###########
+# IAM EC2 Instance Profile for SSM and CW agent
+###########
+  SSMInstanceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: SSMInstanceRole
+      Description: "A SSM role for use by EC2 Instances to be managed."
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                - "ec2:DescribeVolumes"
+                - "ec2:DescribeTags"
+                - "autoscaling:Describe*"
+                - "sns:*"
+                - "iam:GetPolicy"
+                - "iam:GetPolicyVersion"
+                - "iam:GetRole"
+                - "cloudwatch:PutMetricData"
+                - "cloudwatch:SetAlarmState"
+                - "ds:CreateComputer"
+                - "ds:DescribeDirectories"
+                - "ec2:DescribeInstanceStatus"
+                - "logs:*"
+                - "ssm:*"
+                - "ssmmessages:CreateControlChannel"
+                - "ssmmessages:CreateDataChannel"
+                - "ssmmessages:OpenControlChannel"
+                - "ssmmessages:OpenDataChannel"
+                - "ec2messages:*"
+                Resource: '*'
+          PolicyName: LabLoggingPolicy
+
+  SSMInstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      InstanceProfileName: "SSMInstanceProfile"
+      Roles:
+        - !Ref SSMInstanceRole
+
+###########
+# Lambda IAM role for task 8 Lambda-CanaryRole
+###########
+  LambdaCanaryRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Description: "Role to be used for lambda function in task8 of lab4"
+      RoleName: Lambda-CanaryRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                - "dynamodb:DeleteItem"
+                - "dynamodb:GetItem"
+                - "dynamodb:PutItem"
+                - "dynamodb:Scan"
+                - "dynamodb:UpdateItem"
+                Resource: "arn:aws:dynamodb:*:*:table/*"
+              - Effect: Allow
+                Action:
+                - "logs:CreateLogGroup"
+                Resource: "arn:aws:logs:::*"
+              - Effect: Allow
+                Action:
+                - "logs:CreateLogStream"
+                - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:log-group:/aws/lambda/lambda-canary:*"
+          PolicyName: LabLambdaPolicy
+
+###########
+# App Server
+###########
+
+  AppServer:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      AvailabilityZone: !Join
+        - ''
+        - - !Ref 'AWS::Region'
+          - a
+      IamInstanceProfile: !Ref SSMInstanceProfile
+      ImageId: !Ref AmazonLinuxAMIID
+      InstanceType: t3.micro
+      SubnetId: !Ref Subnet1
+      SecurityGroupIds:
+        - !Ref AppServerSG
+      Tags:
+        - Key: Name
+          Value: AppServer
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          yum -y update
+
+###########
+# Parameter Store Agent Configuration File
+###########
+  AgentConfigFile:
+    Type: AWS::SSM::Parameter
+    Properties:
+      DataType: 'text'
+      Description: 'a configuration file to configure the agent used in the lab'
+      Name: 'AgentConfigFile'
+      Tier: 'Standard'
+      Type: StringList
+      Value: '{
+        "agent": {
+          "metrics_collection_interval": 60,
+          "run_as_user": "cwagent"
+        },
+        "metrics": {
+          "append_dimensions": {
+            "AutoScalingGroupName": "${aws:AutoScalingGroupName}",
+            "ImageId": "${aws:ImageId}",
+            "InstanceId": "${aws:InstanceId}",
+            "InstanceType": "${aws:InstanceType}"
+          },
+          "metrics_collected": {
+            "disk": {
+              "measurement": [
+                "used_percent"
+              ],
+              "metrics_collection_interval": 60,
+              "resources": [
+                "*"
+              ]
+            },
+            "mem": {
+              "measurement": [
+                "mem_used_percent"
+              ],
+              "metrics_collection_interval": 60
+            }
+          }
+        }
+      }'
+###########
+# SNS topic for lab tasks
+###########
+  SysOpsTeamPager:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: 'SysOpsTeamPager'
+      TopicName: 'SysOpsTeamPager'
+
+###########
+# Outputs
+###########
+Outputs:
+  LabRegion:
+    Description: "The AWS Region this Lab was created in"
+    Value: !Ref AWS::Region
+    Export:
+      Name: "LabRegion"
+
+  ConfigurationFile:
+    Description: "The configuration file in Parameter Store needed to setup the agent"
+    Value: !Ref AgentConfigFile
